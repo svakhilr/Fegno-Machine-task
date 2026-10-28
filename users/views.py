@@ -10,7 +10,9 @@ from users.serializers import (
     UserResponseSerializer,
 )
 from datetime import datetime
+from django.db import transaction
 from users.helper import get_tokens_for_user, generate_resource_slots
+from users.redis_lock import slot_lock
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.viewsets import ModelViewSet
 from resourses.models import *
@@ -220,28 +222,36 @@ class ResourseViewSet(ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        is_already_booked = Reservation.objects.filter(
-            resource=resource,
-            booking_date=booking_date,
-            booking_status=Reservation.BOOKED,
-            booking_slot_start_time__lt=parsed_end,
-            booking_slot_end_time__gt=parsed_start,
-        ).exists()
+        with slot_lock(resource.id, booking_date, parsed_start, user_id=request.user.id) as acquired:
+            if not acquired:
+                return Response(
+                    {"message": "This slot is currently being reserved by another user. Please choose another slot or try again shortly."},
+                    status=status.HTTP_409_CONFLICT,
+                )
 
-        if is_already_booked:
-            return Response(
-                {"message": "This slot is already booked. Please choose another slot."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            with transaction.atomic():
+                is_already_booked = Reservation.objects.filter(
+                    resource=resource,
+                    booking_date=booking_date,
+                    booking_status=Reservation.BOOKED,
+                    booking_slot_start_time__lt=parsed_end,
+                    booking_slot_end_time__gt=parsed_start,
+                ).exists()
 
-        reservation = Reservation.objects.create(
-            user=request.user,
-            resource=resource,
-            booking_date=booking_date,
-            booking_slot_start_time=parsed_start,
-            booking_slot_end_time=parsed_end,
-            booking_status=Reservation.BOOKED,
-        )
+                if is_already_booked:
+                    return Response(
+                        {"message": "This slot is already booked. Please choose another slot."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                reservation = Reservation.objects.create(
+                    user=request.user,
+                    resource=resource,
+                    booking_date=booking_date,
+                    booking_slot_start_time=parsed_start,
+                    booking_slot_end_time=parsed_end,
+                    booking_status=Reservation.BOOKED,
+                )
 
         return Response(
             {

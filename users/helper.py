@@ -64,6 +64,9 @@ def generate_resource_slots(resource, date_input):
             for res in booked_reservations
         )
 
+        from users.redis_lock import is_slot_locked
+        is_locked = is_slot_locked(resource.id, booking_date, slot_start)
+
         slots.append({
             "start_time": slot_start.strftime("%H:%M:%S"),
             "end_time": slot_end.strftime("%H:%M:%S"),

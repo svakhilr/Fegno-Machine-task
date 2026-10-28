@@ -606,3 +606,117 @@ class AuthAPITests(TestCase):
         self.assertEqual(resp_cancelled.status_code, status.HTTP_200_OK)
         self.assertEqual(resp_cancelled.data["count"], 1)
         self.assertEqual(resp_cancelled.data["results"][0]["booking_status"], "cancelled")
+
+
+class RedisSlotLockTests(TestCase):
+    def setUp(self):
+        from datetime import time
+        from resourses.models import ResourseCategory, Resource
+        from users.redis_lock import get_redis_client
+
+        self.client = APIClient()
+        self.redis_client = get_redis_client()
+
+        self.org = User.objects.create_user(
+            email="redis_org@example.com",
+            password="orgpassword123",
+            role=User.ORGANISATION,
+        )
+        self.user1 = User.objects.create_user(
+            email="redis_user1@example.com",
+            password="userpassword123",
+            first_name="User",
+            last_name="One",
+            role=User.USER,
+        )
+        self.user2 = User.objects.create_user(
+            email="redis_user2@example.com",
+            password="userpassword123",
+            first_name="User",
+            last_name="Two",
+            role=User.USER,
+        )
+        self.cat = ResourseCategory.objects.create(name="Conference Room")
+        self.resource = Resource.objects.create(
+            organisation=self.org,
+            category=self.cat,
+            title="Boardroom",
+            slot_interval=60,
+            slot_start_time=time(9, 0),
+            slot_end_time=time(17, 0),
+        )
+
+    def tearDown(self):
+        # Clean up any leftover test keys in Redis
+        keys = self.redis_client.keys("lock:slot:*")
+        if keys:
+            self.redis_client.delete(*keys)
+
+    def test_acquire_and_release_slot_lock(self):
+        from users.redis_lock import acquire_slot_lock, release_slot_lock, is_slot_locked
+
+        # User 1 acquires lock on 10:00:00 slot
+        acquired1, token1 = acquire_slot_lock(self.resource.id, "2026-11-15", "10:00:00", user_id=self.user1.id)
+        self.assertTrue(acquired1)
+        self.assertIsNotNone(token1)
+        self.assertTrue(is_slot_locked(self.resource.id, "2026-11-15", "10:00:00"))
+
+        # User 2 tries to acquire the EXACT same slot -> must fail!
+        acquired2, token2 = acquire_slot_lock(self.resource.id, "2026-11-15", "10:00:00", user_id=self.user2.id)
+        self.assertFalse(acquired2)
+        self.assertIsNone(token2)
+
+        # User 2 tries to acquire a DIFFERENT slot (11:00:00) on the same resource -> must succeed!
+        acquired_diff, token_diff = acquire_slot_lock(self.resource.id, "2026-11-15", "11:00:00", user_id=self.user2.id)
+        self.assertTrue(acquired_diff)
+        self.assertIsNotNone(token_diff)
+
+        # User 1 releases lock
+        released = release_slot_lock(self.resource.id, "2026-11-15", "10:00:00", token1)
+        self.assertTrue(released)
+        self.assertFalse(is_slot_locked(self.resource.id, "2026-11-15", "10:00:00"))
+
+        # Now User 2 can acquire the previously locked slot
+        acquired_again, token_again = acquire_slot_lock(self.resource.id, "2026-11-15", "10:00:00", user_id=self.user2.id)
+        self.assertTrue(acquired_again)
+        self.assertIsNotNone(token_again)
+
+    def test_make_reservation_rejected_when_slot_is_locked(self):
+        from users.redis_lock import acquire_slot_lock
+
+        # Manually lock slot 09:00 - 10:00 (simulating another user in mid-reservation)
+        acquired, token = acquire_slot_lock(self.resource.id, "2026-11-16", "09:00:00", user_id=self.user1.id)
+        self.assertTrue(acquired)
+
+        # User 2 attempts to reserve the same slot via API
+        self.client.force_authenticate(user=self.user2)
+        payload = {
+            "resourse_id": self.resource.id,
+            "date": "2026-11-16",
+            "start_time": "09:00:00",
+            "end_time": "10:00:00",
+        }
+        response = self.client.post(reverse('user-resource-make-resevation'), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("currently being reserved by another user", response.data["message"])
+
+    def test_get_slot_shows_is_locked(self):
+        from users.redis_lock import acquire_slot_lock
+
+        # Lock 10:00:00 slot
+        acquire_slot_lock(self.resource.id, "2026-11-17", "10:00:00", user_id=self.user1.id)
+
+        self.client.force_authenticate(user=self.user2)
+        response = self.client.get(
+            reverse('user-resource-get-slot'),
+            {'resource_id': self.resource.id, 'date': '2026-11-17'}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        slots = response.data["slots"]
+        slot_09 = next(s for s in slots if s["start_time"] == "09:00:00")
+        slot_10 = next(s for s in slots if s["start_time"] == "10:00:00")
+
+        self.assertFalse(slot_09["is_locked"])
+        self.assertTrue(slot_10["is_locked"])
